@@ -2026,12 +2026,10 @@ def _build_shift_data_summary_html(
         ]
     )
     return (
-        '<div class="shift-data-card">'
         '<div class="shift-data-block-label">Average net sales per included hour · Jan to Mar</div>'
         f'<div class="shift-data-hour-stack">{hour_rows_html}</div>'
         '<div class="shift-summary-divider"></div>'
         f'{totals_html}'
-        "</div>"
     )
 
 
@@ -3645,6 +3643,474 @@ def _create_total_sales_growth_figure(growth_data: pd.DataFrame) -> go.Figure:
     return figure
 
 
+def _prepare_quarterly_business_growth_data(
+    monthly_sales: pd.DataFrame,
+    sales_column: str = "Gross Sale",
+) -> pd.DataFrame:
+    """
+    Aggregate filtered monthly revenue into financial-year quarter revenue and QoQ growth.
+
+    Quarter mapping for this business:
+    - Q1 = Apr-Jun
+    - Q2 = Jul-Sep
+    - Q3 = Oct-Dec
+    - Q4 = Jan-Mar
+
+    Revenue source remains the same as the monthly sales path:
+    - offline from POS
+    - online from delivery_financials
+    """
+    empty_columns = [
+        "Quarter Start",
+        "Quarter Label",
+        "Offline Quarter Revenue",
+        "Online Quarter Revenue",
+        "Quarter Revenue",
+        "Previous Quarter Revenue",
+        "Quarterly Growth %",
+    ]
+    if monthly_sales.empty:
+        return pd.DataFrame(columns=empty_columns)
+
+    required_columns = {
+        "Month Start",
+        sales_column,
+        "Offline Gross Sale",
+        "Online Gross Sale",
+    }
+    if not required_columns.issubset(monthly_sales.columns):
+        return pd.DataFrame(columns=empty_columns)
+
+    quarterly_data = monthly_sales[
+        [
+            "Month Start",
+            sales_column,
+            "Offline Gross Sale",
+            "Online Gross Sale",
+        ]
+    ].copy()
+    quarterly_data["Month Start"] = pd.to_datetime(
+        quarterly_data["Month Start"], errors="coerce"
+    )
+    quarterly_data = quarterly_data.dropna(subset=["Month Start"])
+    if quarterly_data.empty:
+        return pd.DataFrame(columns=empty_columns)
+
+    month_number = quarterly_data["Month Start"].dt.month
+    quarter_number = pd.Series(pd.NA, index=quarterly_data.index, dtype="Int64")
+    quarter_number.loc[month_number.isin([4, 5, 6])] = 1
+    quarter_number.loc[month_number.isin([7, 8, 9])] = 2
+    quarter_number.loc[month_number.isin([10, 11, 12])] = 3
+    quarter_number.loc[month_number.isin([1, 2, 3])] = 4
+    quarterly_data["FY Quarter Number"] = quarter_number
+
+    quarter_start_month = pd.Series(pd.NA, index=quarterly_data.index, dtype="Int64")
+    quarter_start_month.loc[quarter_number == 1] = 4
+    quarter_start_month.loc[quarter_number == 2] = 7
+    quarter_start_month.loc[quarter_number == 3] = 10
+    quarter_start_month.loc[quarter_number == 4] = 1
+    quarterly_data["Quarter Start"] = pd.to_datetime(
+        {
+            "year": quarterly_data["Month Start"].dt.year.astype(int),
+            "month": quarter_start_month.astype(int),
+            "day": 1,
+        },
+        errors="coerce",
+    )
+    quarterly_data["Quarter Revenue"] = pd.to_numeric(
+        quarterly_data[sales_column], errors="coerce"
+    ).fillna(0)
+    quarterly_data["Offline Quarter Revenue"] = pd.to_numeric(
+        quarterly_data["Offline Gross Sale"], errors="coerce"
+    ).fillna(0)
+    quarterly_data["Online Quarter Revenue"] = pd.to_numeric(
+        quarterly_data["Online Gross Sale"], errors="coerce"
+    ).fillna(0)
+    quarterly_data = (
+        quarterly_data.groupby(
+            ["Quarter Start", "FY Quarter Number"], as_index=False
+        )[
+            [
+                "Offline Quarter Revenue",
+                "Online Quarter Revenue",
+                "Quarter Revenue",
+            ]
+        ]
+        .sum()
+        .sort_values("Quarter Start")
+        .reset_index(drop=True)
+    )
+    quarterly_data["Quarter Label"] = quarterly_data["Quarter Start"].map(
+        lambda value: ""
+    )
+    quarterly_data["Quarter Label"] = quarterly_data.apply(
+        lambda row: f'Q{int(row["FY Quarter Number"])} {pd.Timestamp(row["Quarter Start"]).year}',
+        axis=1,
+    )
+    quarterly_data["Previous Quarter Revenue"] = quarterly_data["Quarter Revenue"].shift(1)
+    valid_mask = (
+        quarterly_data["Previous Quarter Revenue"].notna()
+        & (quarterly_data["Previous Quarter Revenue"] != 0)
+    )
+    quarterly_data["Quarterly Growth %"] = pd.NA
+    quarterly_data.loc[valid_mask, "Quarterly Growth %"] = (
+        (
+            quarterly_data.loc[valid_mask, "Quarter Revenue"]
+            - quarterly_data.loc[valid_mask, "Previous Quarter Revenue"]
+        )
+        / quarterly_data.loc[valid_mask, "Previous Quarter Revenue"]
+    ) * 100
+    return quarterly_data.reset_index(drop=True)
+
+
+def _log_quarterly_business_growth_debug(quarterly_data: pd.DataFrame) -> None:
+    """Print quarter revenue and QoQ growth to the terminal log."""
+    if quarterly_data.empty:
+        print("[Quarterly business growth debug] No quarterly revenue available.")
+        return
+    print("[Quarterly business growth debug] Revenue and growth series")
+    print(
+        quarterly_data[
+            [
+                "Quarter Label",
+                "Offline Quarter Revenue",
+                "Online Quarter Revenue",
+                "Quarter Revenue",
+                "Previous Quarter Revenue",
+                "Quarterly Growth %",
+            ]
+        ].to_string(index=False)
+    )
+
+
+def _build_quarterly_business_growth_summary(
+    quarterly_data: pd.DataFrame,
+) -> dict[str, str]:
+    """Build the summary-card values for the quarterly growth section."""
+    valid_growth = quarterly_data.loc[
+        pd.to_numeric(quarterly_data["Quarterly Growth %"], errors="coerce").notna()
+    ].copy()
+    if valid_growth.empty:
+        return {
+            "best_value": "N/A",
+            "best_subtext": "No previous-quarter comparison yet",
+            "best_class": "neutral",
+            "worst_value": "N/A",
+            "worst_subtext": "No previous-quarter comparison yet",
+            "worst_class": "neutral",
+            "avg_value": "N/A",
+            "avg_subtext": "0 valid quarter comparisons",
+            "avg_class": "neutral",
+        }
+
+    best_row = valid_growth.loc[
+        pd.to_numeric(valid_growth["Quarterly Growth %"], errors="coerce").idxmax()
+    ]
+    worst_row = valid_growth.loc[
+        pd.to_numeric(valid_growth["Quarterly Growth %"], errors="coerce").idxmin()
+    ]
+    avg_growth = float(
+        pd.to_numeric(valid_growth["Quarterly Growth %"], errors="coerce").mean()
+    )
+    comparison_count = int(len(valid_growth.index))
+    best_growth = float(best_row["Quarterly Growth %"])
+    worst_growth = float(worst_row["Quarterly Growth %"])
+    return {
+        "best_value": _format_signed_percentage(best_growth),
+        "best_subtext": f'{best_row["Quarter Label"]} · {_format_currency(float(best_row["Quarter Revenue"]))}',
+        "best_class": "positive" if best_growth > 0 else "negative" if best_growth < 0 else "neutral",
+        "worst_value": _format_signed_percentage(worst_growth),
+        "worst_subtext": f'{worst_row["Quarter Label"]} · {_format_currency(float(worst_row["Quarter Revenue"]))}',
+        "worst_class": "positive" if worst_growth > 0 else "negative" if worst_growth < 0 else "neutral",
+        "avg_value": _format_signed_percentage(avg_growth),
+        "avg_subtext": f"{comparison_count} valid quarter comparisons",
+        "avg_class": "positive" if avg_growth > 0 else "negative" if avg_growth < 0 else "neutral",
+    }
+
+
+def _build_quarterly_breakdown_card_html(quarterly_data: pd.DataFrame) -> str:
+    """Render the quarter-by-quarter growth breakdown list."""
+    if quarterly_data.empty:
+        rows_html = (
+            '<div class="quarter-breakdown-empty">'
+            "Quarter breakdown will appear here when revenue data is available."
+            "</div>"
+        )
+    else:
+        growth_series = pd.to_numeric(
+            quarterly_data["Quarterly Growth %"], errors="coerce"
+        )
+        max_abs_growth = (
+            float(growth_series.abs().max()) if growth_series.notna().any() else 0.0
+        )
+        row_parts: list[str] = []
+        for _, row in quarterly_data.iterrows():
+            growth_value = pd.to_numeric(
+                pd.Series([row["Quarterly Growth %"]]), errors="coerce"
+            ).iloc[0]
+            if pd.isna(growth_value):
+                value_text = "—"
+                tone_class = "neutral"
+                fill_width = 0.0
+            else:
+                numeric_growth = float(growth_value)
+                value_text = _format_signed_percentage(numeric_growth)
+                tone_class = (
+                    "positive"
+                    if numeric_growth > 0
+                    else "negative"
+                    if numeric_growth < 0
+                    else "neutral"
+                )
+                fill_width = (
+                    abs(numeric_growth) / max_abs_growth * 100.0
+                    if max_abs_growth
+                    else 0.0
+                )
+
+            row_parts.append(
+                (
+                    '<div class="quarter-breakdown-row">'
+                    '<div class="quarter-breakdown-head">'
+                    f'<span class="quarter-breakdown-label">{row["Quarter Label"]}</span>'
+                    f'<span class="quarter-breakdown-value {tone_class}">{value_text}</span>'
+                    "</div>"
+                    '<div class="quarter-breakdown-track">'
+                    f'<div class="quarter-breakdown-fill {tone_class}" style="width: {fill_width:.1f}%"></div>'
+                    "</div>"
+                    "</div>"
+                )
+            )
+        rows_html = "".join(row_parts)
+
+    return (
+        '<div class="quarter-breakdown-card">'
+        '<div class="growth-summary-title">Quarter Breakdown</div>'
+        f"{rows_html}"
+        "</div>"
+    )
+
+
+def _create_quarterly_business_growth_figure(
+    quarterly_data: pd.DataFrame,
+) -> go.Figure:
+    """Create the quarter-on-quarter growth line chart."""
+    figure = go.Figure()
+    if quarterly_data.empty:
+        figure.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(l=8, r=8, t=10, b=10),
+            height=320,
+            showlegend=False,
+        )
+        return figure
+
+    quarter_labels = quarterly_data["Quarter Label"].astype(str).tolist()
+    valid_growth = quarterly_data.loc[
+        pd.to_numeric(quarterly_data["Quarterly Growth %"], errors="coerce").notna()
+    ].copy()
+    valid_growth_values = pd.to_numeric(
+        valid_growth["Quarterly Growth %"], errors="coerce"
+    ).fillna(0)
+    min_growth = float(valid_growth_values.min()) if not valid_growth_values.empty else 0.0
+    max_growth = float(valid_growth_values.max()) if not valid_growth_values.empty else 0.0
+    lower_bound = min(min_growth, 0.0)
+    upper_bound = max(max_growth, 0.0)
+    padding = max((upper_bound - lower_bound) * 0.12, 4.0)
+
+    if not valid_growth.empty:
+        figure.add_trace(
+            go.Scatter(
+                x=valid_growth["Quarter Label"],
+                y=valid_growth["Quarterly Growth %"],
+                customdata=valid_growth[
+                    ["Quarter Label", "Quarter Revenue", "Previous Quarter Revenue"]
+                ].to_numpy(),
+                mode="lines",
+                line=dict(color=SAGE_MIST_SECONDARY, width=4, shape="spline", smoothing=0.5),
+                fill="tozeroy",
+                fillcolor="rgba(167, 139, 250, 0.12)",
+                hovertemplate=(
+                    "%{customdata[0]}"
+                    "<br>Current Quarter Revenue: €%{customdata[1]:,.2f}"
+                    "<br>Previous Quarter Revenue: €%{customdata[2]:,.2f}"
+                    "<br>Quarterly Growth: %{y:.2f}%"
+                    "<extra></extra>"
+                ),
+                showlegend=False,
+            )
+        )
+
+        positive_quarters = valid_growth.loc[
+            pd.to_numeric(valid_growth["Quarterly Growth %"], errors="coerce") >= 0
+        ]
+        negative_quarters = valid_growth.loc[
+            pd.to_numeric(valid_growth["Quarterly Growth %"], errors="coerce") < 0
+        ]
+        if not positive_quarters.empty:
+            figure.add_trace(
+                go.Scatter(
+                    x=positive_quarters["Quarter Label"],
+                    y=positive_quarters["Quarterly Growth %"],
+                    customdata=positive_quarters[
+                        ["Quarter Label", "Quarter Revenue", "Previous Quarter Revenue"]
+                    ].to_numpy(),
+                    mode="markers",
+                    marker=dict(color=SAGE_MIST_ACCENT, size=13),
+                    hovertemplate=(
+                        "%{customdata[0]}"
+                        "<br>Current Quarter Revenue: €%{customdata[1]:,.2f}"
+                        "<br>Previous Quarter Revenue: €%{customdata[2]:,.2f}"
+                        "<br>Quarterly Growth: %{y:.2f}%"
+                        "<extra></extra>"
+                    ),
+                    showlegend=False,
+                )
+            )
+        if not negative_quarters.empty:
+            figure.add_trace(
+                go.Scatter(
+                    x=negative_quarters["Quarter Label"],
+                    y=negative_quarters["Quarterly Growth %"],
+                    customdata=negative_quarters[
+                        ["Quarter Label", "Quarter Revenue", "Previous Quarter Revenue"]
+                    ].to_numpy(),
+                    mode="markers",
+                    marker=dict(color=SAGE_MIST_ALERT, size=13),
+                    hovertemplate=(
+                        "%{customdata[0]}"
+                        "<br>Current Quarter Revenue: €%{customdata[1]:,.2f}"
+                        "<br>Previous Quarter Revenue: €%{customdata[2]:,.2f}"
+                        "<br>Quarterly Growth: %{y:.2f}%"
+                        "<extra></extra>"
+                    ),
+                    showlegend=False,
+                )
+            )
+
+    figure.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=8, r=8, t=10, b=10),
+        height=320,
+        showlegend=False,
+        xaxis=dict(
+            type="category",
+            categoryorder="array",
+            categoryarray=quarter_labels,
+            tickangle=0,
+            showgrid=True,
+            gridcolor=SAGE_MIST_GRID,
+            tickfont=dict(color=SAGE_MIST_TEXT_MUTED),
+            linecolor=SAGE_MIST_BORDER,
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor=SAGE_MIST_GRID,
+            zeroline=True,
+            zerolinecolor="rgba(148, 163, 184, 0.22)",
+            range=[lower_bound - padding, upper_bound + padding],
+            tickfont=dict(color=SAGE_MIST_TEXT_MUTED),
+            ticksuffix="%",
+        ),
+        font=dict(color=SAGE_MIST_TEXT_STRONG),
+        hoverlabel=dict(
+            bgcolor=SAGE_MIST_SURFACE_SOFT,
+            bordercolor=SAGE_MIST_BORDER,
+            font=dict(color=SAGE_MIST_TEXT_STRONG),
+        ),
+    )
+    return figure
+
+
+def _create_quarterly_revenue_figure(quarterly_data: pd.DataFrame) -> go.Figure:
+    """Create the quarter-by-quarter revenue bar chart."""
+    revenue_values = pd.to_numeric(
+        quarterly_data["Quarter Revenue"], errors="coerce"
+    ).fillna(0)
+    offline_values = pd.to_numeric(
+        quarterly_data["Offline Quarter Revenue"], errors="coerce"
+    ).fillna(0)
+    online_values = pd.to_numeric(
+        quarterly_data["Online Quarter Revenue"], errors="coerce"
+    ).fillna(0)
+    label_text = [
+        _format_compact_currency_label(value) if float(value) >= 1 else ""
+        for value in revenue_values
+    ]
+    label_y = [float(value) * 0.5 for value in revenue_values]
+
+    figure = go.Figure()
+    figure.add_trace(
+        go.Bar(
+            x=quarterly_data["Quarter Label"],
+            y=revenue_values,
+            customdata=list(
+                zip(
+                    offline_values.to_numpy(dtype=float),
+                    online_values.to_numpy(dtype=float),
+                    revenue_values.to_numpy(dtype=float),
+                )
+            ),
+            marker=dict(color=SAGE_MIST_PRIMARY),
+            hovertemplate=(
+                "%{x}"
+                "<br>Offline revenue: €%{customdata[0]:,.2f}"
+                "<br>Online revenue: €%{customdata[1]:,.2f}"
+                "<br>Total revenue: €%{customdata[2]:,.2f}"
+                "<extra></extra>"
+            ),
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=quarterly_data["Quarter Label"],
+            y=label_y,
+            mode="text",
+            text=label_text,
+            textposition="middle center",
+            textfont=dict(
+                color=SAGE_MIST_TEXT_STRONG,
+                size=12,
+                family="Arial Black, Arial Bold, Arial, sans-serif",
+            ),
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    figure.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=8, r=8, t=10, b=10),
+        height=320,
+        showlegend=False,
+        bargap=0.3,
+        xaxis=dict(
+            type="category",
+            tickangle=0,
+            showgrid=False,
+            tickfont=dict(color=SAGE_MIST_TEXT_MUTED),
+            linecolor=SAGE_MIST_BORDER,
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor=SAGE_MIST_GRID,
+            zeroline=False,
+            tickfont=dict(color=SAGE_MIST_TEXT_MUTED),
+            tickprefix="€",
+            tickformat="~s",
+        ),
+        font=dict(color=SAGE_MIST_TEXT_STRONG),
+        hoverlabel=dict(
+            bgcolor=SAGE_MIST_SURFACE_SOFT,
+            bordercolor=SAGE_MIST_BORDER,
+            font=dict(color=SAGE_MIST_TEXT_STRONG),
+        ),
+    )
+    return figure
+
+
 def _calculate_overall_sales_kpis(
     cleaned_tables: dict[str, pd.DataFrame],
     selected_quarter: str = "All Quarters",
@@ -4171,6 +4637,70 @@ def render_overall_sales_page(cleaned_tables: dict[str, pd.DataFrame]) -> None:
             background: rgba(148, 163, 184, 0.26);
             display: inline-block;
         }
+        .quarter-breakdown-card {
+            background: linear-gradient(180deg, rgba(31,41,55,0.98) 0%, rgba(17,24,39,0.98) 100%);
+            border: 1px solid var(--sage-border);
+            border-radius: 22px;
+            padding: 1.1rem 1.15rem 1rem 1.15rem;
+            min-height: 15rem;
+            box-sizing: border-box;
+        }
+        .quarter-breakdown-empty {
+            color: var(--sage-muted);
+            font-size: 0.96rem;
+            line-height: 1.45;
+        }
+        .quarter-breakdown-row + .quarter-breakdown-row {
+            margin-top: 0.75rem;
+        }
+        .quarter-breakdown-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.8rem;
+            margin-bottom: 0.28rem;
+        }
+        .quarter-breakdown-label {
+            color: var(--sage-text);
+            font-size: 0.95rem;
+            font-weight: 700;
+            line-height: 1.3;
+        }
+        .quarter-breakdown-value {
+            font-size: 0.94rem;
+            font-weight: 700;
+            line-height: 1.3;
+            white-space: nowrap;
+        }
+        .quarter-breakdown-value.positive {
+            color: var(--sage-accent);
+        }
+        .quarter-breakdown-value.negative {
+            color: var(--sage-alert);
+        }
+        .quarter-breakdown-value.neutral {
+            color: var(--sage-muted);
+        }
+        .quarter-breakdown-track {
+            width: 100%;
+            height: 0.42rem;
+            border-radius: 999px;
+            background: rgba(148, 163, 184, 0.16);
+            overflow: hidden;
+        }
+        .quarter-breakdown-fill {
+            height: 100%;
+            border-radius: 999px;
+        }
+        .quarter-breakdown-fill.positive {
+            background: linear-gradient(90deg, var(--sage-accent) 0%, #6ee7b7 100%);
+        }
+        .quarter-breakdown-fill.negative {
+            background: linear-gradient(90deg, var(--sage-alert) 0%, #fda4af 100%);
+        }
+        .quarter-breakdown-fill.neutral {
+            background: linear-gradient(90deg, rgba(148,163,184,0.28) 0%, rgba(148,163,184,0.42) 100%);
+        }
         .payment-summary-card {
             background: var(--sage-surface);
             border: 1px solid var(--sage-border);
@@ -4303,6 +4833,29 @@ def render_overall_sales_page(cleaned_tables: dict[str, pd.DataFrame]) -> None:
         selected_quarter=selected_quarter,
         selected_channel=selected_channel,
     )
+    quarterly_sales_breakdown = _prepare_sales_breakdown_data(
+        cleaned_tables=cleaned_tables,
+        selected_quarter=selected_quarter,
+        selected_channel=selected_channel,
+    )
+    quarterly_growth_data = _prepare_quarterly_business_growth_data(
+        quarterly_sales_breakdown,
+        sales_column="Gross Sale",
+    )
+    _log_quarterly_business_growth_debug(quarterly_growth_data)
+    if quarterly_growth_data.empty:
+        best_quarter_revenue = "N/A"
+        best_quarter_label = "No quarter revenue available"
+    else:
+        best_quarter_row = quarterly_growth_data.loc[
+            pd.to_numeric(
+                quarterly_growth_data["Quarter Revenue"], errors="coerce"
+            ).fillna(0).idxmax()
+        ]
+        best_quarter_revenue = _format_currency(
+            float(best_quarter_row["Quarter Revenue"])
+        )
+        best_quarter_label = str(best_quarter_row["Quarter Label"])
 
     st.markdown("<div style='height: 0.85rem;'></div>", unsafe_allow_html=True)
 
@@ -4365,7 +4918,14 @@ def render_overall_sales_page(cleaned_tables: dict[str, pd.DataFrame]) -> None:
         )
 
     with second_row_columns[2]:
-        st.markdown(_build_kpi_placeholder_html(), unsafe_allow_html=True)
+        st.markdown(
+            _build_kpi_card_html(
+                label="Best Performing Quarter",
+                value_text=best_quarter_revenue,
+                support_text=best_quarter_label,
+            ),
+            unsafe_allow_html=True,
+        )
 
     st.markdown("<div style='height: 1rem;'></div>", unsafe_allow_html=True)
 
@@ -4637,6 +5197,70 @@ def render_overall_sales_page(cleaned_tables: dict[str, pd.DataFrame]) -> None:
                         unsafe_allow_html=True,
                     )
                     st.markdown("<div style='height: 0.65rem;'></div>", unsafe_allow_html=True)
+
+    st.markdown("<div style='height: 1.45rem;'></div>", unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="growth-section-title">Quarterly business growth</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="growth-section-subtitle">% growth vs previous quarter</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("<div style='height: 0.8rem;'></div>", unsafe_allow_html=True)
+
+    quarterly_section_columns = st.columns(2, gap="large")
+
+    with quarterly_section_columns[0]:
+        with st.container(border=True):
+            st.markdown(
+                _build_chart_card_header_html(
+                    title="Quarter-by-quarter revenue",
+                    subtitle="Revenue grouped by financial-year quarter",
+                ),
+                unsafe_allow_html=True,
+            )
+            if quarterly_growth_data.empty:
+                st.info(
+                    "Quarterly revenue will appear here when filtered gross-sale data is available."
+                )
+            else:
+                st.markdown(
+                    '<div class="growth-chart-legend" style="visibility:hidden;">'
+                    '<span class="growth-chart-legend-item"><span class="growth-chart-dot positive"></span>Positive</span>'
+                    '<span class="growth-chart-legend-item"><span class="growth-chart-dot negative"></span>Negative</span>'
+                    '<span class="growth-chart-legend-item"><span class="growth-chart-zero-line"></span>Zero line</span>'
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                st.plotly_chart(
+                    _create_quarterly_revenue_figure(quarterly_growth_data),
+                    use_container_width=True,
+                    config={"displayModeBar": False, "responsive": True},
+                )
+
+    with quarterly_section_columns[1]:
+        with st.container(border=True):
+            st.markdown(
+                _build_chart_card_header_html(
+                    title="Quarterly growth %",
+                    subtitle="Financial-year quarter growth vs previous quarter",
+                ),
+                unsafe_allow_html=True,
+            )
+            if quarterly_growth_data.empty or quarterly_growth_data["Quarterly Growth %"].isna().all():
+                st.info(
+                    "Quarterly growth will appear here when at least two quarters are available in the current filtered scope."
+                )
+            else:
+                st.markdown(_build_total_sales_growth_legend_html(), unsafe_allow_html=True)
+                st.plotly_chart(
+                    _create_quarterly_business_growth_figure(quarterly_growth_data),
+                    use_container_width=True,
+                    config={"displayModeBar": False, "responsive": True},
+                )
 
     st.markdown("<div style='height: 1.45rem;'></div>", unsafe_allow_html=True)
 
