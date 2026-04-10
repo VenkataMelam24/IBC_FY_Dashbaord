@@ -18,6 +18,7 @@ OVERALL_SALES_QUARTER_OPTIONS = ["All Quarters", "Q1", "Q2", "Q3", "Q4"]
 OVERALL_SALES_CHANNEL_OPTIONS = ["Overall", "Offline", "Online"]
 GROWTH_CHART_CHANNEL_OPTIONS = ["Combined", "In-house", "Online"]
 SCENARIO_IMPACT_OPTIONS = [-30, -20, -10, 0, 10, 20, 30]
+SHIFT_DAY_GROUP_OPTIONS = ["Whole week", "Tuesday to Friday", "Saturday & Sunday"]
 WEEKDAY_ORDER = [
     "Monday",
     "Tuesday",
@@ -1734,9 +1735,19 @@ def _format_shift_slot_label(hour_value: int) -> str:
     return _format_hour_bucket_label(hour_value)
 
 
+def _get_shift_day_group_weekdays(selected_day_group: str) -> set[int] | None:
+    """Return weekday numbers for the local shift-analysis day-group filter."""
+    if selected_day_group == "Tuesday to Friday":
+        return {1, 2, 3, 4}
+    if selected_day_group == "Saturday & Sunday":
+        return {5, 6}
+    return None
+
+
 def _prepare_shift_analysis_q4_data(
     cleaned_tables: dict[str, pd.DataFrame],
     raw_tables: dict[str, pd.DataFrame],
+    selected_day_group: str = "Whole week",
 ) -> dict[str, object]:
     """
     Build exact Jan-to-Mar 12 PM to 4 PM shift average net revenue data.
@@ -1752,7 +1763,13 @@ def _prepare_shift_analysis_q4_data(
     q4_start = pd.Timestamp("2026-01-01")
     q4_end = pd.Timestamp("2026-03-31")
     included_hours = [12, 13, 14, 15]
-    day_count_in_scope = float(len(pd.date_range(q4_start, q4_end, freq="D")))
+    day_group_weekdays = _get_shift_day_group_weekdays(selected_day_group)
+    scope_dates = pd.date_range(q4_start, q4_end, freq="D")
+    if day_group_weekdays is None:
+        filtered_scope_dates = scope_dates
+    else:
+        filtered_scope_dates = scope_dates[scope_dates.weekday.isin(day_group_weekdays)]
+    day_count_in_scope = float(len(filtered_scope_dates))
     offline_net_multiplier = 0.87
     online_net_multiplier = 0.62
 
@@ -1772,6 +1789,17 @@ def _prepare_shift_analysis_q4_data(
             end_date=q4_end,
             date_columns=["Date"],
         )
+    if not pos_filtered.empty:
+        if "Time-Stamp" in pos_filtered.columns:
+            pos_scope_datetime = pd.to_datetime(
+                pos_filtered["Time-Stamp"], errors="coerce"
+            )
+        else:
+            pos_scope_datetime = pd.to_datetime(pos_filtered.get("Date"), errors="coerce")
+        if day_group_weekdays is not None:
+            pos_filtered = pos_filtered.loc[
+                pos_scope_datetime.dt.weekday.isin(day_group_weekdays)
+            ].copy()
 
     hourly_index = pd.Index(included_hours, name="Hour")
     offline_sales = pd.Series(0.0, index=hourly_index, dtype="float64")
@@ -1816,6 +1844,10 @@ def _prepare_shift_analysis_q4_data(
                     q4_end + pd.Timedelta(days=1) - pd.Timedelta(seconds=1),
                 )
             ].copy()
+            if day_group_weekdays is not None:
+                online_data = online_data.loc[
+                    online_data["Order Datetime Raw"].dt.weekday.isin(day_group_weekdays)
+                ].copy()
             raw_rows_after_filter = int(len(online_data.index))
 
             if not online_data.empty:
@@ -1871,6 +1903,7 @@ def _prepare_shift_analysis_q4_data(
         "scope_start": q4_start,
         "scope_end": q4_end,
         "included_hours": included_hours,
+        "selected_day_group": selected_day_group,
         "day_count_in_scope": day_count_in_scope,
         "hourly_revenue": shift_hourly,
         "offline_gross_revenue": float(shift_hourly["Offline Average Gross Revenue"].sum()),
@@ -1886,6 +1919,7 @@ def _prepare_shift_analysis_q4_data(
             "scope_start": str(q4_start.date()),
             "scope_end": str(q4_end.date()),
             "included_hours": included_hours,
+            "selected_day_group": selected_day_group,
             "day_count_in_scope": day_count_in_scope,
             "offline_source": "POS Time-Stamp + Amount",
             "online_source": "delivery_partner_raw_url raw table Date + Time + Sale",
@@ -6363,10 +6397,24 @@ def render_performance_analysis_page(
 
     st.markdown("<div style='height: 1.45rem;'></div>", unsafe_allow_html=True)
 
-    st.markdown(
-        '<div class="deep-section-title">12pm – 4pm shift analysis</div>',
-        unsafe_allow_html=True,
-    )
+    shift_title_column, shift_filter_column = st.columns([4.6, 1.4], gap="small")
+    with shift_title_column:
+        st.markdown(
+            '<div class="deep-section-title">12pm – 4pm shift analysis</div>',
+            unsafe_allow_html=True,
+        )
+    with shift_filter_column:
+        st.markdown(
+            '<div class="overall-filter-label">Day group</div>',
+            unsafe_allow_html=True,
+        )
+        shift_day_group = st.selectbox(
+            "Shift analysis day group",
+            SHIFT_DAY_GROUP_OPTIONS,
+            index=0,
+            key="deep_insights_shift_day_group_filter",
+            label_visibility="collapsed",
+        )
     st.markdown(
         '<div class="deep-section-subtitle">Net revenue vs cost for this time bucket</div>',
         unsafe_allow_html=True,
@@ -6381,6 +6429,7 @@ def render_performance_analysis_page(
     shift_analysis = _prepare_shift_analysis_q4_data(
         cleaned_tables=cleaned_tables,
         raw_tables=raw_tables,
+        selected_day_group=shift_day_group,
     )
     shift_hourly = shift_analysis["hourly_revenue"]
     offline_shift_gross_revenue = float(shift_analysis["offline_gross_revenue"])
