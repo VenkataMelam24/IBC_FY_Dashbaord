@@ -1737,11 +1737,56 @@ def _format_shift_slot_label(hour_value: int) -> str:
 
 def _get_shift_day_group_weekdays(selected_day_group: str) -> set[int] | None:
     """Return weekday numbers for the local shift-analysis day-group filter."""
+    if selected_day_group in {"All Days", "Whole week"}:
+        return None
+    if selected_day_group in {"Monday–Thursday", "Monday-Thursday"}:
+        return {0, 1, 2, 3}
+    if selected_day_group in {"Friday–Sunday", "Friday-Sunday"}:
+        return {4, 5, 6}
     if selected_day_group == "Tuesday to Friday":
         return {1, 2, 3, 4}
     if selected_day_group == "Saturday & Sunday":
         return {5, 6}
     return None
+
+
+def _calculate_latest_mom_growth(monthly_sales: pd.DataFrame) -> dict[str, object]:
+    """Return the latest valid month-on-month growth from a monthly sales series."""
+    if monthly_sales.empty or not {"Month Start", "Total Sales"}.issubset(
+        monthly_sales.columns
+    ):
+        return {"value": None, "support": "No month comparison"}
+
+    sales_series = monthly_sales.copy()
+    sales_series["Month Start"] = pd.to_datetime(
+        sales_series["Month Start"], errors="coerce"
+    )
+    sales_series["Total Sales"] = pd.to_numeric(
+        sales_series["Total Sales"], errors="coerce"
+    ).fillna(0)
+    sales_series = sales_series.dropna(subset=["Month Start"]).sort_values(
+        "Month Start"
+    )
+    sales_series["Previous Sales"] = sales_series["Total Sales"].shift(1)
+    valid_growth = sales_series.loc[
+        sales_series["Previous Sales"].notna() & (sales_series["Previous Sales"] != 0)
+    ].copy()
+    if valid_growth.empty:
+        return {"value": None, "support": "No valid previous month"}
+
+    valid_growth["MoM Growth %"] = (
+        (valid_growth["Total Sales"] - valid_growth["Previous Sales"])
+        / valid_growth["Previous Sales"]
+    ) * 100
+    latest_row = valid_growth.iloc[-1]
+    previous_month = (
+        pd.Timestamp(latest_row["Month Start"]) - pd.DateOffset(months=1)
+    ).strftime("%b")
+    current_month = pd.Timestamp(latest_row["Month Start"]).strftime("%b")
+    return {
+        "value": float(latest_row["MoM Growth %"]),
+        "support": f"{current_month} vs {previous_month}",
+    }
 
 
 def _prepare_shift_analysis_q4_data(
@@ -1803,14 +1848,19 @@ def _prepare_shift_analysis_q4_data(
 
     hourly_index = pd.Index(included_hours, name="Hour")
     offline_sales = pd.Series(0.0, index=hourly_index, dtype="float64")
+    pos_shift_data = pos_filtered.iloc[0:0].copy()
     if not pos_filtered.empty and {"Hour", "Amount"}.issubset(pos_filtered.columns):
-        offline_sales = (
+        pos_shift_data = (
             pos_filtered.assign(
                 HourValue=pd.to_numeric(pos_filtered["Hour"], errors="coerce"),
                 AmountValue=pd.to_numeric(pos_filtered["Amount"], errors="coerce").fillna(0),
             )
             .dropna(subset=["HourValue"])
             .loc[lambda dataframe: dataframe["HourValue"].isin(included_hours)]
+            .copy()
+        )
+        offline_sales = (
+            pos_shift_data
             .groupby("HourValue")["AmountValue"]
             .sum()
             .reindex(hourly_index)
@@ -1819,6 +1869,7 @@ def _prepare_shift_analysis_q4_data(
 
     delivery_partner_raw = raw_tables.get("delivery_partner_raw", pd.DataFrame()).copy()
     online_sales = pd.Series(0.0, index=hourly_index, dtype="float64")
+    online_shift_data = pd.DataFrame()
     raw_rows_after_filter = 0
     if not delivery_partner_raw.empty:
         date_column = _find_column_name(delivery_partner_raw, ["Date", "Date "])
@@ -1851,9 +1902,13 @@ def _prepare_shift_analysis_q4_data(
             raw_rows_after_filter = int(len(online_data.index))
 
             if not online_data.empty:
-                online_sales = (
+                online_shift_data = (
                     online_data.dropna(subset=["HourValue"])
                     .loc[lambda dataframe: dataframe["HourValue"].isin(included_hours)]
+                    .copy()
+                )
+                online_sales = (
+                    online_shift_data
                     .groupby("HourValue")["Sale Numeric"]
                     .sum()
                     .reindex(hourly_index)
@@ -1898,6 +1953,90 @@ def _prepare_shift_analysis_q4_data(
     shift_hourly["Total Average Net Revenue"] = (
         shift_hourly["Total Net Revenue"] / day_count_in_scope if day_count_in_scope else 0.0
     )
+    offline_shift_sales = float(shift_hourly["Offline Gross Revenue"].sum())
+    online_shift_sales = float(shift_hourly["Online Gross Revenue"].sum())
+    total_shift_sales = offline_shift_sales + online_shift_sales
+    offline_shift_net_sales = float(shift_hourly["Offline Net Revenue"].sum())
+    online_shift_net_sales = float(shift_hourly["Online Net Revenue"].sum())
+    total_shift_net_sales = offline_shift_net_sales + online_shift_net_sales
+    offline_shift_orders = _count_valid_offline_orders(pos_shift_data)
+    online_shift_orders = int(len(online_shift_data.index)) if not online_shift_data.empty else 0
+    offline_shift_aov = (
+        offline_shift_net_sales / offline_shift_orders if offline_shift_orders else 0.0
+    )
+    online_shift_aov = (
+        online_shift_net_sales / online_shift_orders if online_shift_orders else 0.0
+    )
+
+    monthly_offline_sales = pd.DataFrame(columns=["Month Start", "Offline Sales"])
+    if not pos_shift_data.empty:
+        if "Time-Stamp" in pos_shift_data.columns:
+            pos_month_series = pd.to_datetime(
+                pos_shift_data["Time-Stamp"], errors="coerce"
+            )
+        else:
+            pos_month_series = pd.to_datetime(pos_shift_data.get("Date"), errors="coerce")
+        monthly_offline_sales = (
+            pos_shift_data.assign(
+                Month_Start=pos_month_series.dt.to_period("M").dt.to_timestamp(),
+                AmountValue=(
+                    pd.to_numeric(
+                    pos_shift_data.get("AmountValue", pos_shift_data.get("Amount")),
+                    errors="coerce",
+                    ).fillna(0)
+                    * offline_net_multiplier
+                ),
+            )
+            .dropna(subset=["Month_Start"])
+            .groupby("Month_Start", as_index=False)["AmountValue"]
+            .sum()
+            .rename(
+                columns={
+                    "Month_Start": "Month Start",
+                    "AmountValue": "Offline Sales",
+                }
+            )
+        )
+
+    monthly_online_sales = pd.DataFrame(columns=["Month Start", "Online Sales"])
+    if not online_shift_data.empty:
+        monthly_online_sales = (
+            online_shift_data.assign(
+                Month_Start=online_shift_data["Order Datetime Raw"]
+                .dt.to_period("M")
+                .dt.to_timestamp(),
+                NetSaleNumeric=pd.to_numeric(
+                    online_shift_data["Sale Numeric"], errors="coerce"
+                ).fillna(0)
+                * online_net_multiplier,
+            )
+            .dropna(subset=["Month_Start"])
+            .groupby("Month_Start", as_index=False)["NetSaleNumeric"]
+            .sum()
+            .rename(
+                columns={
+                    "Month_Start": "Month Start",
+                    "NetSaleNumeric": "Online Sales",
+                }
+            )
+        )
+
+    monthly_shift_sales = pd.merge(
+        monthly_offline_sales,
+        monthly_online_sales,
+        on="Month Start",
+        how="outer",
+    ).fillna(0)
+    if not monthly_shift_sales.empty:
+        monthly_shift_sales["Month Start"] = pd.to_datetime(
+            monthly_shift_sales["Month Start"], errors="coerce"
+        )
+        monthly_shift_sales["Total Sales"] = (
+            pd.to_numeric(monthly_shift_sales["Offline Sales"], errors="coerce").fillna(0)
+            + pd.to_numeric(monthly_shift_sales["Online Sales"], errors="coerce").fillna(0)
+        )
+        monthly_shift_sales = monthly_shift_sales.sort_values("Month Start").reset_index(drop=True)
+    mom_growth = _calculate_latest_mom_growth(monthly_shift_sales)
 
     result = {
         "scope_start": q4_start,
@@ -1911,6 +2050,21 @@ def _prepare_shift_analysis_q4_data(
         "offline_net_revenue": float(shift_hourly["Offline Average Net Revenue"].sum()),
         "online_net_revenue": float(shift_hourly["Online Average Net Revenue"].sum()),
         "total_net_revenue": float(shift_hourly["Total Average Net Revenue"].sum()),
+        "offline_shift_sales": offline_shift_sales,
+        "online_shift_sales": online_shift_sales,
+        "total_shift_sales": total_shift_sales,
+        "offline_shift_net_sales": offline_shift_net_sales,
+        "online_shift_net_sales": online_shift_net_sales,
+        "total_shift_net_sales": total_shift_net_sales,
+        "offline_shift_orders": offline_shift_orders,
+        "online_shift_orders": online_shift_orders,
+        "offline_shift_sales_share": _safe_ratio(offline_shift_net_sales, total_shift_net_sales),
+        "online_shift_sales_share": _safe_ratio(online_shift_net_sales, total_shift_net_sales),
+        "offline_shift_aov": offline_shift_aov,
+        "online_shift_aov": online_shift_aov,
+        "shift_mom_growth_pct": mom_growth["value"],
+        "shift_mom_growth_support": mom_growth["support"],
+        "monthly_shift_sales": monthly_shift_sales,
     }
 
     print(
@@ -1931,6 +2085,14 @@ def _prepare_shift_analysis_q4_data(
             "offline_average_shift_net_revenue": result["offline_net_revenue"],
             "online_average_shift_net_revenue": result["online_net_revenue"],
             "average_shift_net_revenue": result["total_net_revenue"],
+            "offline_shift_orders": offline_shift_orders,
+            "online_shift_orders": online_shift_orders,
+            "online_sales_share": result["online_shift_sales_share"],
+            "offline_sales_share": result["offline_shift_sales_share"],
+            "online_aov": online_shift_aov,
+            "offline_aov": offline_shift_aov,
+            "latest_shift_mom_growth_pct": mom_growth["value"],
+            "latest_shift_mom_growth_support": mom_growth["support"],
         },
     )
     print(shift_hourly.to_string(index=False))
@@ -6421,11 +6583,11 @@ def render_performance_analysis_page(
     )
     st.markdown("<div style='height: 0.8rem;'></div>", unsafe_allow_html=True)
 
-    # This section uses exact Jan-to-Mar gross sales only from:
+    # This section uses exact Jan-to-Mar shift sales only from:
     # - POS table for offline/in-house sales
     # - delivery_partner_raw_url raw table for online sales
     # It calculates interactive shift profitability for the 12 PM to 4 PM bucket
-    # using channel-adjusted average net sales per included hour slot, not summed quarter revenue.
+    # using channel-adjusted net sales per included hour slot, not full-day revenue.
     shift_analysis = _prepare_shift_analysis_q4_data(
         cleaned_tables=cleaned_tables,
         raw_tables=raw_tables,
@@ -6437,6 +6599,69 @@ def render_performance_analysis_page(
     offline_shift_net_revenue = float(shift_analysis["offline_net_revenue"])
     online_shift_net_revenue = float(shift_analysis["online_net_revenue"])
     average_shift_net_revenue = float(shift_analysis["total_net_revenue"])
+    shift_mom_growth_pct = shift_analysis["shift_mom_growth_pct"]
+    shift_mom_growth_value = (
+        _format_signed_percentage(float(shift_mom_growth_pct))
+        if shift_mom_growth_pct is not None
+        else "N/A"
+    )
+    shift_mom_growth_style = ""
+    if shift_mom_growth_pct is not None:
+        shift_mom_growth_style = (
+            f' style="color:{SAGE_MIST_ACCENT};"'
+            if float(shift_mom_growth_pct) >= 0
+            else f' style="color:{SAGE_MIST_ALERT};"'
+        )
+    shift_kpi_specs = [
+        (
+            "Online Sales %",
+            _format_percentage_value(float(shift_analysis["online_shift_sales_share"]) * 100),
+            "12–4pm net sales",
+            "",
+        ),
+        (
+            "Offline Sales %",
+            _format_percentage_value(float(shift_analysis["offline_shift_sales_share"]) * 100),
+            "12–4pm net sales",
+            "",
+        ),
+        (
+            "Online Avg Order Value",
+            _format_currency(float(shift_analysis["online_shift_aov"])),
+            f'{_format_whole_number(int(shift_analysis["online_shift_orders"]))} orders',
+            "",
+        ),
+        (
+            "Offline Avg Order Value",
+            _format_currency(float(shift_analysis["offline_shift_aov"])),
+            f'{_format_whole_number(int(shift_analysis["offline_shift_orders"]))} orders',
+            "",
+        ),
+        (
+            "Month-on-Month Growth %",
+            shift_mom_growth_value,
+            str(shift_analysis["shift_mom_growth_support"]),
+            shift_mom_growth_style,
+        ),
+    ]
+    shift_kpi_columns = st.columns(5, gap="medium")
+    for column, (label, value, support_text, value_style) in zip(
+        shift_kpi_columns,
+        shift_kpi_specs,
+    ):
+        with column:
+            st.markdown(
+                (
+                    '<div class="deep-hourly-kpi-card">'
+                    f'<div class="deep-hourly-kpi-label">{label}</div>'
+                    f'<div class="deep-hourly-kpi-value"{value_style}>{value}</div>'
+                    f'<div class="deep-hourly-kpi-support">{support_text}</div>'
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("<div style='height: 0.9rem;'></div>", unsafe_allow_html=True)
     # Shift staffing always runs through the fixed 4 PM shift end for this section.
     fixed_shift_end_time = time(16, 0)
 
